@@ -1,12 +1,13 @@
 import warnings
 from pathlib import Path
+import subprocess
+import sys
 
 import joblib
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
-import gdown
 
 from pymoo.algorithms.moo.nsga2 import NSGA2
 from pymoo.core.problem import Problem
@@ -30,20 +31,32 @@ st.title("🏭 AI-Driven Manufacturing Optimization System")
 # ------------------------------------------------
 
 MODEL_FILES = {
-    "energy_model_v2.pkl": "https://drive.google.com/file/d/1ovkaPwuHaqJdRgDR8KazawStJwqIiWnV/view?usp=drive_link",
-    "energy_model.pkl": "https://drive.google.com/file/d/1WETsfnlnvBi-ozd8N3V0HkaEixWBfhUj/view?usp=sharing"
+    "energy_model_v2.pkl": "1ovkaPwuHaqJdRgDR8KazawStJwqIiWnV",
+    "energy_model.pkl": "1WETsfnlnvBi-ozd8N3V0HkaEixWBfhUj",
 }
+
+
+def get_gdown():
+    """
+    Import gdown, installing it into the active Python environment if needed.
+    """
+    try:
+        import gdown as installed_gdown
+    except ModuleNotFoundError:
+        with st.spinner("Installing missing dependency: gdown"):
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "gdown"])
+        import gdown as installed_gdown
+
+    return installed_gdown
 
 
 def ensure_models_downloaded():
     """
     Download models from Google Drive if not present locally
     """
+    gdown = get_gdown()
+
     for filename, file_id in MODEL_FILES.items():
-
-        if file_id == "https://drive.google.com/file/d/1ovkaPwuHaqJdRgDR8KazawStJwqIiWnV/view?usp=drive_link":
-            continue
-
         path = Path(filename)
 
         if not path.exists():
@@ -210,6 +223,95 @@ def compute_phase_alert_thresholds(phase_df):
     }
 
 
+def compute_numeric_bounds(df, columns):
+
+    lower = df[columns].quantile(0.05).to_numpy(dtype=float)
+    upper = df[columns].quantile(0.95).to_numpy(dtype=float)
+
+    equal_mask = np.isclose(lower, upper)
+    upper[equal_mask] = lower[equal_mask] + 1.0
+
+    return lower, upper
+
+
+class EnergyOptimizationProblem(Problem):
+
+    def __init__(self, model, numeric_cols, feature_order, phase_flags, baseline, lower, upper):
+
+        super().__init__(
+            n_var=len(numeric_cols),
+            n_obj=2,
+            n_constr=0,
+            xl=lower,
+            xu=upper,
+        )
+        self.model = model
+        self.numeric_cols = numeric_cols
+        self.feature_order = feature_order
+        self.phase_flags = phase_flags
+        self.baseline = np.array(baseline, dtype=float)
+        self.scale = np.maximum(upper - lower, 1e-6)
+
+    def _evaluate(self, X, out, *args, **kwargs):
+
+        candidate_df = pd.DataFrame(X, columns=self.numeric_cols)
+
+        for phase_col, phase_value in self.phase_flags.items():
+            candidate_df[phase_col] = phase_value
+
+        candidate_df = build_feature_frame(candidate_df, self.feature_order)
+
+        energy = self.model.predict(candidate_df)
+
+        deviation = np.mean(
+            np.abs((X - self.baseline) / self.scale),
+            axis=1
+        )
+
+        out["F"] = np.column_stack([energy, deviation])
+
+
+def generate_optimization_candidates(
+    model,
+    train_df,
+    numeric_cols,
+    feature_order,
+    phase_flags,
+    baseline,
+    current_prediction,
+):
+
+    lower, upper = compute_numeric_bounds(train_df, numeric_cols)
+
+    problem = EnergyOptimizationProblem(
+        model=model,
+        numeric_cols=numeric_cols,
+        feature_order=feature_order,
+        phase_flags=phase_flags,
+        baseline=baseline,
+        lower=lower,
+        upper=upper,
+    )
+
+    result = minimize(
+        problem,
+        NSGA2(pop_size=40),
+        ("n_gen", 20),
+        seed=42,
+        verbose=False,
+    )
+
+    candidates = pd.DataFrame(result.X, columns=numeric_cols)
+    candidates["Predicted_Energy"] = result.F[:, 0]
+    candidates["Change_Score"] = result.F[:, 1]
+    candidates["Energy_Saved"] = float(current_prediction) - candidates["Predicted_Energy"]
+
+    return candidates.sort_values(
+        ["Predicted_Energy", "Change_Score"],
+        ascending=[True, True]
+    ).reset_index(drop=True)
+
+
 # ------------------------------------------------
 # ENSURE MODELS EXIST
 # ------------------------------------------------
@@ -360,6 +462,226 @@ st.metric(
     "Prediction Error",
     f"{abs(actual_energy - selected_prediction):.2f} kW"
 )
+
+
+# ------------------------------------------------
+# BATCH VISUALS
+# ------------------------------------------------
+
+st.subheader("Batch Trend Analysis")
+
+batch_plot = batch_data.copy()
+batch_plot["Predicted_Energy"] = energy_model.predict(
+    build_feature_frame(batch_plot, features)
+)
+
+if "Time_Minutes" in batch_plot.columns:
+    x_axis = "Time_Minutes"
+else:
+    batch_plot["Record_Index"] = np.arange(1, len(batch_plot) + 1)
+    x_axis = "Record_Index"
+
+energy_trend = px.line(
+    batch_plot,
+    x=x_axis,
+    y=["Power_Consumption_kW", "Predicted_Energy"],
+    labels={
+        "value": "Energy (kW)",
+        "variable": "Series",
+        "Time_Minutes": "Time (Minutes)",
+    },
+    title=f"Energy Profile for {selected_batch}",
+)
+st.plotly_chart(energy_trend, use_container_width=True)
+
+parameter_trend = px.line(
+    batch_plot,
+    x=x_axis,
+    y=numeric_features,
+    labels={
+        "value": "Sensor Reading",
+        "variable": "Parameter",
+        "Time_Minutes": "Time (Minutes)",
+    },
+    title="Process Parameters Across the Selected Batch",
+)
+st.plotly_chart(parameter_trend, use_container_width=True)
+
+
+# ------------------------------------------------
+# ALERTS
+# ------------------------------------------------
+
+st.subheader("Operational Alerts")
+
+phase_history = data[
+    data[phase_column_map[selected_phase]].astype(bool)
+].copy()
+
+if phase_history.empty:
+    phase_history = data.copy()
+
+thresholds = compute_phase_alert_thresholds(phase_history)
+
+alert_messages = []
+
+for metric_name, threshold in thresholds.items():
+    current_metric_value = float(selected_row[metric_name])
+    if current_metric_value >= threshold:
+        alert_messages.append(
+            f"{metric_name} is elevated at {current_metric_value:.2f} "
+            f"(phase threshold {threshold:.2f})."
+        )
+
+if alert_messages:
+    for message in alert_messages:
+        st.warning(message)
+else:
+    st.success(f"No active threshold breaches detected for the {selected_phase} phase.")
+
+
+# ------------------------------------------------
+# FLEET INSIGHTS
+# ------------------------------------------------
+
+st.subheader("Fleet Insights")
+
+phase_labels = np.select(
+    [
+        data["Phase_Preparation"].astype(bool),
+        data["Phase_Compression"].astype(bool),
+        data["Phase_Quality_Testing"].astype(bool),
+    ],
+    [
+        "Preparation",
+        "Compression",
+        "Quality Testing",
+    ],
+    default="Unknown",
+)
+
+phase_summary = (
+    data.assign(Phase_Label=phase_labels)
+    .groupby("Phase_Label", as_index=False)["Power_Consumption_kW"]
+    .mean()
+    .sort_values("Power_Consumption_kW", ascending=False)
+)
+
+phase_chart = px.bar(
+    phase_summary,
+    x="Phase_Label",
+    y="Power_Consumption_kW",
+    color="Phase_Label",
+    title="Average Energy Consumption by Phase",
+    labels={
+        "Phase_Label": "Phase",
+        "Power_Consumption_kW": "Average Energy (kW)",
+    },
+)
+st.plotly_chart(phase_chart, use_container_width=True)
+
+batch_summary = (
+    data.groupby("Batch_ID", as_index=False)
+    .agg(
+        Avg_Energy=("Power_Consumption_kW", "mean"),
+        Peak_Energy=("Power_Consumption_kW", "max"),
+        Avg_Vibration=("Vibration_mm_s", "mean"),
+    )
+    .sort_values("Avg_Energy", ascending=False)
+)
+
+left_col, right_col = st.columns(2)
+
+left_col.dataframe(
+    batch_summary.head(10),
+    use_container_width=True,
+    hide_index=True,
+)
+
+feature_importance_df = pd.DataFrame({
+    "Feature": features,
+    "Importance": energy_model.feature_importances_,
+}).sort_values("Importance", ascending=False)
+
+importance_chart = px.bar(
+    feature_importance_df.head(10),
+    x="Importance",
+    y="Feature",
+    orientation="h",
+    title="Top Drivers of Predicted Energy",
+)
+right_col.plotly_chart(importance_chart, use_container_width=True)
+
+
+# ------------------------------------------------
+# OPTIMIZATION ADVISOR
+# ------------------------------------------------
+
+st.subheader("Optimization Advisor")
+
+with st.expander("Generate operating recommendations", expanded=True):
+    if st.button("Run Recommendation Search", use_container_width=True):
+        candidates = generate_optimization_candidates(
+            model=energy_model,
+            train_df=training_data,
+            numeric_cols=numeric_features,
+            feature_order=features,
+            phase_flags=phase_flags,
+            baseline=current_values,
+            current_prediction=selected_prediction,
+        )
+
+        best_candidate = candidates.iloc[0]
+
+        rec1, rec2, rec3 = st.columns(3)
+        rec1.metric("Recommended Energy", f"{best_candidate['Predicted_Energy']:.2f} kW")
+        rec2.metric("Estimated Savings", f"{best_candidate['Energy_Saved']:.2f} kW")
+        rec3.metric("Change Score", f"{best_candidate['Change_Score']:.3f}")
+
+        comparison_df = pd.DataFrame({
+            "Parameter": numeric_features,
+            "Current": current_values,
+            "Recommended": [best_candidate[col] for col in numeric_features],
+        })
+        comparison_df["Delta"] = comparison_df["Recommended"] - comparison_df["Current"]
+
+        st.dataframe(comparison_df, use_container_width=True, hide_index=True)
+
+        pareto_chart = px.scatter(
+            candidates,
+            x="Change_Score",
+            y="Predicted_Energy",
+            color="Energy_Saved",
+            hover_data=numeric_features,
+            title="Recommendation Trade-off: Change Magnitude vs Energy",
+            labels={
+                "Change_Score": "Operational Change Score",
+                "Predicted_Energy": "Predicted Energy (kW)",
+            },
+        )
+        pareto_chart.add_scatter(
+            x=[best_candidate["Change_Score"]],
+            y=[best_candidate["Predicted_Energy"]],
+            mode="markers+text",
+            name="Optimal Point",
+            text=["Optimal"],
+            textposition="top center",
+            marker={
+                "size": 16,
+                "symbol": "star",
+                "color": "#d62728",
+                "line": {"width": 2, "color": "#ffffff"},
+            },
+            hovertemplate=(
+                "Optimal Point"
+                "<br>Operational Change Score: %{x:.3f}"
+                "<br>Predicted Energy: %{y:.2f} kW"
+                "<extra></extra>"
+            ),
+        )
+        st.plotly_chart(pareto_chart, use_container_width=True)
+    else:
+        st.caption("Run the search to generate energy-saving parameter recommendations for the selected batch.")
 
 
 # ------------------------------------------------
