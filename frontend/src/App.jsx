@@ -116,7 +116,8 @@ async function fetchJson(path) {
   const response = await fetch(`${API_BASE_URL}${path}`);
 
   if (!response.ok) {
-    throw new Error(`Request failed: ${response.status}`);
+    const message = await response.text();
+    throw new Error(message || `Request failed: ${response.status}`);
   }
 
   return response.json();
@@ -260,7 +261,14 @@ export default function App() {
   }
 
   if (!bootstrap) {
-    return <div className="app-shell status-view">Unable to initialize the dashboard.</div>;
+    return (
+      <div className="app-shell status-view">
+        <div>
+          <div>Unable to initialize the dashboard.</div>
+          {error ? <div className="error-banner">{error}</div> : null}
+        </div>
+      </div>
+    );
   }
 
   const parameterMeta = bootstrap.overview.parameterMeta;

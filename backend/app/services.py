@@ -1,6 +1,7 @@
 import warnings
 from functools import lru_cache
 from pathlib import Path
+import os
 
 import gdown
 import joblib
@@ -147,6 +148,11 @@ def estimate_quality_confidence_percent(change_score, alert_count):
 
 
 def ensure_models_downloaded():
+    allow_remote_models = os.getenv("ENABLE_MODEL_DOWNLOAD", "false").lower() == "true"
+
+    if not allow_remote_models:
+        return
+
     for filename, file_id in MODEL_FILES.items():
         path = PROJECT_ROOT / filename
 
