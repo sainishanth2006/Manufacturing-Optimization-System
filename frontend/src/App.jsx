@@ -15,6 +15,7 @@ import {
 } from "recharts";
 
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL ?? "").replace(/\/$/, "");
+const THEME_STORAGE_KEY = "manufacturing-dashboard-theme";
 
 const numberFormatter = new Intl.NumberFormat("en-US", {
   maximumFractionDigits: 2,
@@ -114,10 +115,21 @@ function DataTable({ columns, rows }) {
 
 async function fetchJson(path) {
   const response = await fetch(`${API_BASE_URL}${path}`);
+  const contentType = response.headers.get("content-type") ?? "";
 
   if (!response.ok) {
     const message = await response.text();
     throw new Error(message || `Request failed: ${response.status}`);
+  }
+
+  if (!contentType.includes("application/json")) {
+    const body = await response.text();
+    const looksLikeHtml = body.trim().startsWith("<");
+    throw new Error(
+      looksLikeHtml
+        ? "API returned HTML instead of JSON. This usually means the app is deployed as a static site or the API routes are not reaching FastAPI."
+        : "API returned a non-JSON response.",
+    );
   }
 
   return response.json();
@@ -134,7 +146,24 @@ export default function App() {
   const [loadingDashboard, setLoadingDashboard] = useState(false);
   const [loadingOptimization, setLoadingOptimization] = useState(false);
   const [error, setError] = useState("");
+  const [theme, setTheme] = useState(() => {
+    if (typeof window === "undefined") {
+      return "dark";
+    }
+
+    const savedTheme = window.localStorage.getItem(THEME_STORAGE_KEY);
+    if (savedTheme === "light" || savedTheme === "dark") {
+      return savedTheme;
+    }
+
+    return window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+  });
   const deferredBatchId = useDeferredValue(selectedBatchId);
+
+  useEffect(() => {
+    document.body.dataset.theme = theme;
+    window.localStorage.setItem(THEME_STORAGE_KEY, theme);
+  }, [theme]);
 
   useEffect(() => {
     let cancelled = false;
@@ -280,7 +309,16 @@ export default function App() {
     <div className="app-shell">
       <header className="hero">
         <div className="hero-copy">
-          <span className="eyebrow">Production Energy Monitoring</span>
+          <div className="hero-topbar">
+            <span className="eyebrow">Production Energy Monitoring</span>
+            <button
+              className="theme-toggle"
+              type="button"
+              onClick={() => setTheme((currentTheme) => (currentTheme === "dark" ? "light" : "dark"))}
+            >
+              {theme === "dark" ? "Light Mode" : "Dark Mode"}
+            </button>
+          </div>
           <h1>Manufacturing Optimization Control Room</h1>
           <p>
             Monitor batch energy behavior, review process conditions, and generate operational
