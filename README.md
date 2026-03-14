@@ -27,7 +27,7 @@ npm run build
 npm run dev
 ```
 
-The React app defaults to `http://localhost:8000`. To change it, copy `frontend/.env.example` to `frontend/.env`:
+The React app uses the same host by default. For local frontend-only development, you can point it to a separate backend by copying `frontend/.env.example` to `frontend/.env`:
 
 ```bash
 VITE_API_BASE_URL=http://localhost:8000
