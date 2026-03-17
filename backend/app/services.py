@@ -23,6 +23,7 @@ MODEL_FILES = {
 }
 
 DEFAULT_RETRAIN_THRESHOLD_PERCENT = 15.0
+DEFAULT_CARBON_ALERT_PERCENT = 85.0
 CARBON_EMISSION_FACTOR = 0.82
 
 NUMERIC_FEATURES = [
@@ -163,6 +164,80 @@ def classify_retraining_recommendation(drift_percent, retrain_threshold_percent)
 
 def calculate_carbon_emission(energy_value):
     return float(energy_value) * CARBON_EMISSION_FACTOR
+
+
+def classify_carbon_status(carbon_emission, carbon_limit):
+    if carbon_limit <= 0:
+        return "Review"
+    if carbon_emission >= carbon_limit:
+        return "Exceeded"
+    if carbon_emission >= carbon_limit * (DEFAULT_CARBON_ALERT_PERCENT / 100):
+        return "Monitor"
+    return "Stable"
+
+
+def build_carbon_reduction_suggestions(selected_row, phase_history):
+    recommendations = []
+    prioritized_features = [
+        (
+            "Temperature_C",
+            "Lower the process temperature toward the phase median of {target:.2f} C to cut avoidable energy draw.",
+        ),
+        (
+            "Motor_Speed_RPM",
+            "Trim motor speed toward {target:.2f} RPM where throughput allows to reduce carbon intensity.",
+        ),
+        (
+            "Compression_Force_kN",
+            "Reduce compression force closer to {target:.2f} kN while staying inside quality limits.",
+        ),
+        (
+            "Flow_Rate_LPM",
+            "Tune flow rate toward {target:.2f} LPM to avoid excess pumping energy.",
+        ),
+        (
+            "Pressure_Bar",
+            "Bring line pressure closer to {target:.2f} bar and check for unnecessary over-pressurization.",
+        ),
+        (
+            "Vibration_mm_s",
+            "Investigate vibration and restore it toward {target:.2f} mm/s to reduce mechanical losses.",
+        ),
+    ]
+
+    for feature, template in prioritized_features:
+        if feature not in phase_history.columns:
+            continue
+
+        target = float(phase_history[feature].median())
+        current = float(selected_row[feature])
+        tolerance = max(abs(target) * 0.05, 0.1)
+        if current > target + tolerance:
+            recommendations.append(
+                {
+                    "feature": feature,
+                    "current": round(current, 3),
+                    "target": round(target, 3),
+                    "message": template.format(target=target),
+                }
+            )
+
+        if len(recommendations) == 3:
+            break
+
+    if not recommendations:
+        recommendations.append(
+            {
+                "feature": "general",
+                "current": None,
+                "target": None,
+                "message": (
+                    "Hold the current operating window steady and run the Optimization Advisor to identify the lowest-carbon feasible settings for this batch."
+                ),
+            }
+        )
+
+    return recommendations
 
 
 def ensure_models_downloaded():
@@ -338,6 +413,11 @@ class ManufacturingRepository:
             self.data["Power_Consumption_kW"],
             self.data["Predicted_Energy"],
         )
+        self.default_carbon_limit = float(
+            self.data["Power_Consumption_kW"]
+            .apply(calculate_carbon_emission)
+            .quantile(0.9)
+        )
         self.last_retrained_batch_id = None
         self.model_monitoring = self._build_model_monitoring(self.get_latest_batch_id())
 
@@ -468,6 +548,7 @@ class ManufacturingRepository:
             "parameterMeta": PARAM_META,
             "latestBatchId": self.get_latest_batch_id(),
             "defaultRetrainThresholdPercent": DEFAULT_RETRAIN_THRESHOLD_PERCENT,
+            "defaultCarbonLimitKg": round(float(self.default_carbon_limit), 2),
             "modelMonitoring": self.model_monitoring,
         }
 
@@ -527,6 +608,7 @@ class ManufacturingRepository:
         batch_id,
         retrain_threshold_percent=DEFAULT_RETRAIN_THRESHOLD_PERCENT,
         auto_retrain=False,
+        carbon_limit_kg=None,
     ):
         context = self._build_batch_context(batch_id)
         batch_data = context["batchData"].copy()
@@ -557,6 +639,21 @@ class ManufacturingRepository:
         if phase_history.empty:
             phase_history = self.data.copy()
 
+        resolved_carbon_limit = (
+            float(carbon_limit_kg)
+            if carbon_limit_kg is not None
+            else float(self.default_carbon_limit)
+        )
+        carbon_status = classify_carbon_status(
+            context["actualCarbonEmission"],
+            resolved_carbon_limit,
+        )
+        carbon_delta = context["actualCarbonEmission"] - resolved_carbon_limit
+        carbon_suggestions = build_carbon_reduction_suggestions(
+            context["selectedRow"],
+            phase_history,
+        )
+
         default_thresholds = compute_phase_alert_thresholds(phase_history)
         thresholds = default_thresholds
         alerts = []
@@ -578,6 +675,20 @@ class ManufacturingRepository:
                         ),
                     }
                 )
+
+        if carbon_status == "Exceeded":
+            alerts.append(
+                {
+                    "metric": "Carbon_Emission",
+                    "value": round(float(context["actualCarbonEmission"]), 2),
+                    "threshold": round(float(resolved_carbon_limit), 2),
+                    "message": (
+                        f"Carbon footprint is elevated at {context['actualCarbonEmission']:.2f} kg CO2 "
+                        f"(limit {resolved_carbon_limit:.2f} kg CO2)."
+                    ),
+                    "insight": carbon_suggestions[0]["message"],
+                }
+            )
 
         phase_labels = np.select(
             [
@@ -655,6 +766,22 @@ class ManufacturingRepository:
                 retrain_threshold_percent=retrain_threshold_percent,
                 auto_retrain=auto_retrain,
             ),
+            "carbonMonitoring": {
+                "actualCarbonEmission": round(float(context["actualCarbonEmission"]), 3),
+                "predictedCarbonEmission": round(float(context["predictedCarbonEmission"]), 3),
+                "carbonLimitKg": round(float(resolved_carbon_limit), 3),
+                "deltaKg": round(float(carbon_delta), 3),
+                "exceeded": bool(carbon_status == "Exceeded"),
+                "status": carbon_status,
+                "insight": (
+                    "Carbon footprint exceeded the configured limit. Apply the recommended process adjustments to bring the batch back inside the carbon guardrail."
+                    if carbon_status == "Exceeded"
+                    else "Carbon footprint is approaching the configured limit. Consider small operating adjustments before it breaches the guardrail."
+                    if carbon_status == "Monitor"
+                    else "Carbon footprint remains inside the configured limit for the selected batch."
+                ),
+                "suggestions": carbon_suggestions,
+            },
             "alerts": alerts,
             "phaseSummary": [
                 {

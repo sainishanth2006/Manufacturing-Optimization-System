@@ -67,6 +67,7 @@ def batch_dashboard(
     batch_id: str,
     retrain_threshold_percent: float = Query(default=15.0),
     auto_retrain: bool = Query(default=False),
+    carbon_limit_kg: float | None = Query(default=None),
 ):
     repository = get_repository()
 
@@ -75,6 +76,7 @@ def batch_dashboard(
             batch_id,
             retrain_threshold_percent=retrain_threshold_percent,
             auto_retrain=auto_retrain,
+            carbon_limit_kg=carbon_limit_kg,
         )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc

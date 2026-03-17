@@ -144,6 +144,7 @@ export default function App() {
   const [selectedAnalyticsView, setSelectedAnalyticsView] = useState("phase");
   const [retrainThresholdPercent, setRetrainThresholdPercent] = useState(15);
   const [autoRetrainEnabled, setAutoRetrainEnabled] = useState(true);
+  const [carbonLimitKg, setCarbonLimitKg] = useState(0);
   const [loadingBootstrap, setLoadingBootstrap] = useState(true);
   const [loadingDashboard, setLoadingDashboard] = useState(false);
   const [loadingOptimization, setLoadingOptimization] = useState(false);
@@ -184,6 +185,7 @@ export default function App() {
         setSelectedBatchId(payload.defaultBatchId ?? "");
         setSelectedParameter(payload.overview.parameterMeta[0]?.key ?? "Temperature_C");
         setRetrainThresholdPercent(payload.overview.defaultRetrainThresholdPercent ?? 15);
+        setCarbonLimitKg(payload.overview.defaultCarbonLimitKg ?? 0);
       } catch (loadError) {
         if (!cancelled) {
           setError(loadError.message);
@@ -218,6 +220,7 @@ export default function App() {
         const query = new URLSearchParams({
           retrain_threshold_percent: String(retrainThresholdPercent),
           auto_retrain: autoRetrainEnabled ? "true" : "false",
+          carbon_limit_kg: String(carbonLimitKg),
         });
 
         const payload = await fetchJson(
@@ -242,7 +245,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [deferredBatchId, retrainThresholdPercent, autoRetrainEnabled]);
+  }, [deferredBatchId, retrainThresholdPercent, autoRetrainEnabled, carbonLimitKg]);
 
   useEffect(() => {
     if (!deferredBatchId) {
@@ -315,6 +318,7 @@ export default function App() {
   const currentAnalyticsLabel =
     ANALYTICS_VIEWS.find((view) => view.key === selectedAnalyticsView)?.label ?? "Energy By Phase";
   const modelMonitoring = dashboard?.modelMonitoring;
+  const carbonMonitoring = dashboard?.carbonMonitoring;
 
   return (
     <div className="app-shell">
@@ -443,6 +447,92 @@ export default function App() {
             value={`${numberFormatter.format(modelMonitoring?.driftPercent ?? 0)} %`}
             hint={modelMonitoring?.insight ?? "Calculating retraining guidance for the selected batch."}
           />
+        </div>
+      </SectionCard>
+
+      <SectionCard
+        title="Carbon Guardrail"
+        subtitle="Set a carbon-footprint limit for the active batch and surface targeted reduction actions when the latest reading moves above that limit."
+        actions={
+          <button
+            className="secondary-button"
+            type="button"
+            onClick={() => setCarbonLimitKg(bootstrap.overview.defaultCarbonLimitKg ?? 0)}
+          >
+            Reset Carbon Limit
+          </button>
+        }
+      >
+        <div className="threshold-grid">
+          <label className="threshold-field">
+            <span>Carbon limit (kg CO2)</span>
+            <input
+              type="number"
+              step="0.1"
+              min="0"
+              value={carbonLimitKg}
+              onChange={(event) => setCarbonLimitKg(event.target.value)}
+            />
+            <small>
+              The dashboard warns when the latest batch carbon footprint exceeds this limit.
+            </small>
+          </label>
+        </div>
+
+        <div className="metrics-grid compact">
+          <MetricCard
+            label="Actual Carbon"
+            value={`${numberFormatter.format(carbonMonitoring?.actualCarbonEmission ?? 0)} kg CO2`}
+            hint="Latest measured carbon footprint for the selected batch."
+          />
+          <MetricCard
+            label="Carbon Limit"
+            value={`${numberFormatter.format(carbonMonitoring?.carbonLimitKg ?? carbonLimitKg ?? 0)} kg CO2`}
+            hint={`Status: ${carbonMonitoring?.status ?? "Loading"}`}
+          />
+          <MetricCard
+            label={carbonMonitoring?.deltaKg > 0 ? "Exceeded By" : "Headroom"}
+            value={`${numberFormatter.format(Math.abs(carbonMonitoring?.deltaKg ?? 0))} kg CO2`}
+            hint={carbonMonitoring?.insight ?? "Calculating carbon guardrail status for the selected batch."}
+          />
+        </div>
+
+        {carbonMonitoring ? (
+          carbonMonitoring.exceeded ? (
+            <div className="alert-stack">
+              <div className="alert-item carbon-alert">
+                <strong>Carbon limit exceeded</strong>
+                <p>
+                  The latest batch reading is{" "}
+                  {numberFormatter.format(carbonMonitoring.actualCarbonEmission)} kg CO2, which is{" "}
+                  {numberFormatter.format(carbonMonitoring.deltaKg)} kg CO2 above the configured limit.
+                </p>
+              </div>
+            </div>
+          ) : carbonMonitoring.status === "Monitor" ? (
+            <div className="empty-state carbon-monitor">
+              Carbon footprint is close to the configured limit. Pre-emptive tuning is recommended.
+            </div>
+          ) : null
+        ) : null}
+
+        <div className="alert-stack">
+          {carbonMonitoring?.suggestions?.map((suggestion, index) => (
+            <div className="alert-item carbon-suggestion" key={`${suggestion.feature}-${index}`}>
+              <strong>
+                {suggestion.feature === "general"
+                  ? "Recommended change"
+                  : formatFeatureName(suggestion.feature)}
+              </strong>
+              <p>{suggestion.message}</p>
+              {suggestion.current !== null && suggestion.target !== null ? (
+                <p className="alert-insight">
+                  Current: {numberFormatter.format(suggestion.current)} | Target:{" "}
+                  {numberFormatter.format(suggestion.target)}
+                </p>
+              ) : null}
+            </div>
+          ))}
         </div>
       </SectionCard>
 
