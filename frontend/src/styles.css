@@ -154,7 +154,9 @@ body::before {
 select,
 .mini-select,
 .primary-button,
-.theme-toggle {
+.theme-toggle,
+.secondary-button,
+.threshold-field input {
   font: inherit;
 }
 
@@ -181,6 +183,15 @@ select,
 .primary-button:disabled {
   opacity: 0.65;
   cursor: wait;
+}
+
+.secondary-button {
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 10px 14px;
+  background: var(--surface);
+  color: var(--text);
+  cursor: pointer;
 }
 
 .theme-toggle {
@@ -285,6 +296,32 @@ th {
   gap: 12px;
 }
 
+.threshold-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.threshold-field {
+  display: grid;
+  gap: 8px;
+}
+
+.threshold-field span,
+.threshold-field small {
+  color: var(--muted);
+}
+
+.threshold-field input {
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface);
+  color: var(--text);
+  padding: 10px 12px;
+}
+
 .alert-item,
 .error-banner,
 .empty-state {
@@ -340,7 +377,8 @@ body[data-theme="light"] .error-banner {
   .hero,
   .content-grid,
   .metrics-grid,
-  .metrics-grid.compact {
+  .metrics-grid.compact,
+  .threshold-grid {
     grid-template-columns: 1fr;
   }
 }

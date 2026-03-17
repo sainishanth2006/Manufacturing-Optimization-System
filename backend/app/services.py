@@ -22,6 +22,9 @@ MODEL_FILES = {
     "energy_model.pkl": "1WETsfnlnvBi-ozd8N3V0HkaEixWBfhUj",
 }
 
+DEFAULT_RETRAIN_THRESHOLD_PERCENT = 15.0
+CARBON_EMISSION_FACTOR = 0.82
+
 NUMERIC_FEATURES = [
     "Temperature_C",
     "Pressure_Bar",
@@ -147,6 +150,21 @@ def estimate_quality_confidence_percent(change_score, alert_count):
     return float(np.clip(confidence, 70, 99))
 
 
+def classify_retraining_recommendation(drift_percent, retrain_threshold_percent):
+    if retrain_threshold_percent <= 0:
+        return "Review"
+
+    if drift_percent >= retrain_threshold_percent:
+        return "Recommended"
+    if drift_percent >= retrain_threshold_percent * 0.7:
+        return "Monitor"
+    return "Stable"
+
+
+def calculate_carbon_emission(energy_value):
+    return float(energy_value) * CARBON_EMISSION_FACTOR
+
+
 def ensure_models_downloaded():
     allow_remote_models = os.getenv("ENABLE_MODEL_DOWNLOAD", "false").lower() == "true"
 
@@ -212,6 +230,28 @@ def load_or_train_model(train_df):
     joblib.dump(model, PROJECT_ROOT / "energy_model_runtime.pkl")
 
     return model, "Trained fresh model"
+
+
+def train_model_from_dataframe(train_df):
+    feature_drop = [
+        "Power_Consumption_kW",
+        "Batch_ID",
+        "Time_Minutes",
+    ]
+
+    X = train_df.drop(columns=feature_drop, errors="ignore")
+    y = train_df["Power_Consumption_kW"]
+
+    model = RandomForestRegressor(
+        n_estimators=300,
+        max_depth=14,
+        random_state=42,
+        n_jobs=-1,
+    )
+    model.fit(X, y)
+    joblib.dump(model, PROJECT_ROOT / "energy_model_runtime.pkl")
+
+    return model
 
 
 class EnergyOptimizationProblem(Problem):
@@ -298,6 +338,8 @@ class ManufacturingRepository:
             self.data["Power_Consumption_kW"],
             self.data["Predicted_Energy"],
         )
+        self.last_retrained_batch_id = None
+        self.model_monitoring = self._build_model_monitoring(self.get_latest_batch_id())
 
     def get_latest_batch_id(self):
         batch_series = self.data["Batch_ID"].dropna().astype(str)
@@ -312,6 +354,110 @@ class ManufacturingRepository:
         batch_ids = self.data["Batch_ID"].dropna().astype(str).unique().tolist()
         return sorted(batch_ids)
 
+    def _refresh_predictions(self):
+        self.features = list(self.model.feature_names_in_)
+        self.data = self.data.copy()
+        self.data["Predicted_Energy"] = self.model.predict(
+            build_feature_frame(self.data, self.features)
+        )
+        self.overall_mae = mean_absolute_error(
+            self.data["Power_Consumption_kW"],
+            self.data["Predicted_Energy"],
+        )
+
+    def _retrain_model_for_batch(self, batch_id):
+        batch_frame = self._get_batch_frame(batch_id)
+        combined_training = pd.concat(
+            [self.training_data, batch_frame],
+            ignore_index=True,
+        ).drop_duplicates()
+        self.training_data = combined_training.reset_index(drop=True)
+        self.model = train_model_from_dataframe(self.training_data)
+        self.model_source = f"Auto-retrained using {batch_id}"
+        self.last_retrained_batch_id = str(batch_id)
+        self._refresh_predictions()
+
+    def _build_model_monitoring(
+        self,
+        batch_id,
+        retrain_threshold_percent=DEFAULT_RETRAIN_THRESHOLD_PERCENT,
+        auto_retrain=False,
+    ):
+        if not batch_id:
+            return {
+                "batchId": None,
+                "batchMae": 0.0,
+                "baselineMae": round(float(self.overall_mae), 3),
+                "driftPercent": 0.0,
+                "retrainThresholdPercent": round(float(retrain_threshold_percent), 2),
+                "autoRetrainEnabled": bool(auto_retrain),
+                "modelRetrained": False,
+                "status": "Stable",
+                "insight": "No batch was available for retraining assessment.",
+            }
+
+        batch_frame = self._get_batch_frame(batch_id).copy()
+        batch_predictions = self.model.predict(
+            build_feature_frame(batch_frame, self.features)
+        )
+        batch_mae = mean_absolute_error(
+            batch_frame["Power_Consumption_kW"],
+            batch_predictions,
+        )
+        baseline_mae = float(self.overall_mae)
+        drift_percent = (
+            ((batch_mae - baseline_mae) / baseline_mae) * 100 if baseline_mae > 0 else 0.0
+        )
+        should_retrain = (
+            auto_retrain
+            and drift_percent >= retrain_threshold_percent
+            and self.last_retrained_batch_id != str(batch_id)
+        )
+
+        if should_retrain:
+            self._retrain_model_for_batch(batch_id)
+            retrained_monitoring = self._build_model_monitoring(
+                batch_id,
+                retrain_threshold_percent=retrain_threshold_percent,
+                auto_retrain=False,
+            )
+            retrained_monitoring["modelRetrained"] = True
+            retrained_monitoring["autoRetrainEnabled"] = True
+            retrained_monitoring["insight"] = (
+                "Error drift crossed the configured threshold, so the model was retrained automatically for this session."
+            )
+            return retrained_monitoring
+
+        status = classify_retraining_recommendation(
+            drift_percent,
+            retrain_threshold_percent,
+        )
+
+        if status == "Recommended":
+            insight = (
+                "Selected-batch prediction error is above the configured drift threshold. Auto-retraining can be triggered for this batch."
+            )
+        elif status == "Monitor":
+            insight = (
+                "Selected-batch performance is drifting upward toward the retraining threshold. Continue monitoring closely."
+            )
+        else:
+            insight = (
+                "Selected-batch performance remains within the expected error band, so the current model is still suitable for operational use."
+            )
+
+        return {
+            "batchId": str(batch_id),
+            "batchMae": round(float(batch_mae), 3),
+            "baselineMae": round(float(baseline_mae), 3),
+            "driftPercent": round(float(drift_percent), 2),
+            "retrainThresholdPercent": round(float(retrain_threshold_percent), 2),
+            "autoRetrainEnabled": bool(auto_retrain),
+            "modelRetrained": False,
+            "status": status,
+            "insight": insight,
+        }
+
     def get_overview(self):
         return {
             "modelSource": self.model_source,
@@ -321,6 +467,8 @@ class ManufacturingRepository:
             "numericFeatures": NUMERIC_FEATURES,
             "parameterMeta": PARAM_META,
             "latestBatchId": self.get_latest_batch_id(),
+            "defaultRetrainThresholdPercent": DEFAULT_RETRAIN_THRESHOLD_PERCENT,
+            "modelMonitoring": self.model_monitoring,
         }
 
     def _get_batch_frame(self, batch_id):
@@ -359,6 +507,8 @@ class ManufacturingRepository:
 
         selected_prediction = float(self.model.predict(selected_input)[0])
         actual_energy = float(selected_row["Power_Consumption_kW"])
+        actual_carbon_emission = calculate_carbon_emission(actual_energy)
+        predicted_carbon_emission = calculate_carbon_emission(selected_prediction)
 
         return {
             "batchData": batch_data,
@@ -368,9 +518,16 @@ class ManufacturingRepository:
             "currentValues": current_values,
             "selectedPrediction": selected_prediction,
             "actualEnergy": actual_energy,
+            "actualCarbonEmission": actual_carbon_emission,
+            "predictedCarbonEmission": predicted_carbon_emission,
         }
 
-    def get_batch_dashboard(self, batch_id):
+    def get_batch_dashboard(
+        self,
+        batch_id,
+        retrain_threshold_percent=DEFAULT_RETRAIN_THRESHOLD_PERCENT,
+        auto_retrain=False,
+    ):
         context = self._build_batch_context(batch_id)
         batch_data = context["batchData"].copy()
         batch_data["Predicted_Energy"] = self.model.predict(
@@ -400,7 +557,8 @@ class ManufacturingRepository:
         if phase_history.empty:
             phase_history = self.data.copy()
 
-        thresholds = compute_phase_alert_thresholds(phase_history)
+        default_thresholds = compute_phase_alert_thresholds(phase_history)
+        thresholds = default_thresholds
         alerts = []
         for metric_name, threshold in thresholds.items():
             current_value = float(context["selectedRow"][metric_name])
@@ -447,6 +605,7 @@ class ManufacturingRepository:
             .agg(
                 Avg_Energy=("Power_Consumption_kW", "mean"),
                 Peak_Energy=("Power_Consumption_kW", "max"),
+                Total_Energy=("Power_Consumption_kW", "sum"),
                 Avg_Vibration=("Vibration_mm_s", "mean"),
             )
             .sort_values("Avg_Energy", ascending=False)
@@ -476,6 +635,8 @@ class ManufacturingRepository:
             "metrics": {
                 "actualEnergy": round(context["actualEnergy"], 3),
                 "predictedEnergy": round(context["selectedPrediction"], 3),
+                "actualCarbonEmission": round(context["actualCarbonEmission"], 3),
+                "predictedCarbonEmission": round(context["predictedCarbonEmission"], 3),
                 "predictionError": round(
                     abs(context["actualEnergy"] - context["selectedPrediction"]),
                     3,
@@ -483,6 +644,17 @@ class ManufacturingRepository:
             },
             "currentSnapshot": current_snapshot,
             "trendData": trend_points,
+            "defaultThresholds": {
+                metric_name: round(float(value), 2) for metric_name, value in default_thresholds.items()
+            },
+            "activeThresholds": {
+                metric_name: round(float(value), 2) for metric_name, value in thresholds.items()
+            },
+            "modelMonitoring": self._build_model_monitoring(
+                batch_id,
+                retrain_threshold_percent=retrain_threshold_percent,
+                auto_retrain=auto_retrain,
+            ),
             "alerts": alerts,
             "phaseSummary": [
                 {
@@ -496,6 +668,10 @@ class ManufacturingRepository:
                     "batchId": str(row["Batch_ID"]),
                     "avgEnergy": round(float(row["Avg_Energy"]), 3),
                     "peakEnergy": round(float(row["Peak_Energy"]), 3),
+                    "carbonEmission": round(
+                        calculate_carbon_emission(float(row["Total_Energy"])),
+                        3,
+                    ),
                     "avgVibration": round(float(row["Avg_Vibration"]), 3),
                 }
                 for _, row in batch_summary.iterrows()

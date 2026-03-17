@@ -1,7 +1,7 @@
 import os
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
@@ -63,11 +63,19 @@ def bootstrap():
 
 
 @app.get("/api/batches/{batch_id}")
-def batch_dashboard(batch_id: str):
+def batch_dashboard(
+    batch_id: str,
+    retrain_threshold_percent: float = Query(default=15.0),
+    auto_retrain: bool = Query(default=False),
+):
     repository = get_repository()
 
     try:
-        return repository.get_batch_dashboard(batch_id)
+        return repository.get_batch_dashboard(
+            batch_id,
+            retrain_threshold_percent=retrain_threshold_percent,
+            auto_retrain=auto_retrain,
+        )
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 

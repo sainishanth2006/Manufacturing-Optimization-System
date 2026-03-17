@@ -142,6 +142,8 @@ export default function App() {
   const [selectedBatchId, setSelectedBatchId] = useState("");
   const [selectedParameter, setSelectedParameter] = useState("Temperature_C");
   const [selectedAnalyticsView, setSelectedAnalyticsView] = useState("phase");
+  const [retrainThresholdPercent, setRetrainThresholdPercent] = useState(15);
+  const [autoRetrainEnabled, setAutoRetrainEnabled] = useState(true);
   const [loadingBootstrap, setLoadingBootstrap] = useState(true);
   const [loadingDashboard, setLoadingDashboard] = useState(false);
   const [loadingOptimization, setLoadingOptimization] = useState(false);
@@ -181,6 +183,7 @@ export default function App() {
         setBootstrap(payload);
         setSelectedBatchId(payload.defaultBatchId ?? "");
         setSelectedParameter(payload.overview.parameterMeta[0]?.key ?? "Temperature_C");
+        setRetrainThresholdPercent(payload.overview.defaultRetrainThresholdPercent ?? 15);
       } catch (loadError) {
         if (!cancelled) {
           setError(loadError.message);
@@ -212,7 +215,14 @@ export default function App() {
       setError("");
 
       try {
-        const payload = await fetchJson(`/api/batches/${deferredBatchId}`);
+        const query = new URLSearchParams({
+          retrain_threshold_percent: String(retrainThresholdPercent),
+          auto_retrain: autoRetrainEnabled ? "true" : "false",
+        });
+
+        const payload = await fetchJson(
+          `/api/batches/${deferredBatchId}?${query.toString()}`,
+        );
         if (!cancelled) {
           setDashboard(payload);
         }
@@ -232,7 +242,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [deferredBatchId]);
+  }, [deferredBatchId, retrainThresholdPercent, autoRetrainEnabled]);
 
   useEffect(() => {
     if (!deferredBatchId) {
@@ -304,6 +314,7 @@ export default function App() {
   const formatFeatureName = (feature) => PARAMETER_LABELS[feature] ?? feature.replaceAll("_", " ");
   const currentAnalyticsLabel =
     ANALYTICS_VIEWS.find((view) => view.key === selectedAnalyticsView)?.label ?? "Energy By Phase";
+  const modelMonitoring = dashboard?.modelMonitoring;
 
   return (
     <div className="app-shell">
@@ -357,11 +368,83 @@ export default function App() {
           value={`${numberFormatter.format(bootstrap.overview.predictionMae)} kW`}
         />
         <MetricCard
-          label="Current Batch"
-          value={dashboard?.batchId ?? selectedBatchId}
-          hint={dashboard ? `Phase: ${dashboard.selectedPhase}` : "Loading"}
+          label="Retraining Status"
+          value={modelMonitoring?.status ?? "Loading"}
+          hint={
+            modelMonitoring
+              ? `Batch ${modelMonitoring.batchId ?? "N/A"} | Drift ${numberFormatter.format(modelMonitoring.driftPercent)} %`
+              : "Calculating"
+          }
         />
       </section>
+
+      <SectionCard
+        title="Model Monitoring"
+        subtitle="Configure the batch-level drift threshold and let the system retrain automatically when the selected batch exceeds it."
+        actions={
+          <button
+            className="secondary-button"
+            type="button"
+            onClick={() =>
+              setRetrainThresholdPercent(
+                bootstrap.overview.defaultRetrainThresholdPercent ?? 15,
+              )
+            }
+          >
+            Reset Threshold
+          </button>
+        }
+      >
+        <div className="threshold-grid">
+          <label className="threshold-field">
+            <span>Retrain trigger threshold (%)</span>
+            <input
+              type="number"
+              step="1"
+              min="1"
+              value={retrainThresholdPercent}
+              onChange={(event) => setRetrainThresholdPercent(event.target.value)}
+            />
+            <small>
+              Auto-retrain when selected-batch drift crosses this percentage above baseline error.
+            </small>
+          </label>
+
+          <label className="threshold-field threshold-toggle">
+            <span>Automatic retraining</span>
+            <button
+              className="secondary-button"
+              type="button"
+              onClick={() => setAutoRetrainEnabled((value) => !value)}
+            >
+              {autoRetrainEnabled ? "Enabled" : "Disabled"}
+            </button>
+            <small>
+              {autoRetrainEnabled
+                ? "The model retrains automatically when the threshold is crossed."
+                : "The dashboard only flags retraining recommendations."}
+            </small>
+          </label>
+        </div>
+
+        <div className="metrics-grid compact">
+          <MetricCard
+            label="Selected Batch MAE"
+            value={`${numberFormatter.format(modelMonitoring?.batchMae ?? 0)} kW`}
+            hint={`Batch ${modelMonitoring?.batchId ?? "N/A"}`}
+          />
+          <MetricCard
+            label="Baseline MAE"
+            value={`${numberFormatter.format(modelMonitoring?.baselineMae ?? 0)} kW`}
+            hint="Portfolio-wide reference error"
+          />
+          <MetricCard
+            label="Error Drift"
+            value={`${numberFormatter.format(modelMonitoring?.driftPercent ?? 0)} %`}
+            hint={modelMonitoring?.insight ?? "Calculating retraining guidance for the selected batch."}
+          />
+        </div>
+      </SectionCard>
 
       {loadingDashboard || !dashboard ? (
         <div className="status-view">Loading batch analytics...</div>
@@ -382,6 +465,11 @@ export default function App() {
               label="Prediction Error"
               value={`${numberFormatter.format(dashboard.metrics.predictionError)} kW`}
               hint="Gap between measured consumption and model expectation."
+            />
+            <MetricCard
+              label="Carbon Emission"
+              value={`${numberFormatter.format(dashboard.metrics.actualCarbonEmission)} kg CO2`}
+              hint="Estimated carbon output for the latest point in the selected batch."
             />
             <MetricCard
               label="Current Snapshot"
@@ -526,6 +614,11 @@ export default function App() {
                       key: "peakEnergy",
                       label: "Peak Energy",
                       format: (value) => `${numberFormatter.format(value)} kW`,
+                    },
+                    {
+                      key: "carbonEmission",
+                      label: "Carbon Emission",
+                      format: (value) => `${numberFormatter.format(value)} kg CO2`,
                     },
                     {
                       key: "avgVibration",
